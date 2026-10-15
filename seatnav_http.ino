@@ -1,14 +1,13 @@
 /*
-  SeatNav: radar + Wi-Fi broadcast (MQTT)
+  SeatNav: radar + direct reports to the SeatNav backend (HTTP/HTTPS)
 
-  Same seat logic as seatnav_single_led, but instead of driving an LED,
-  every state change is sent over Wi-Fi to an MQTT broker. Your app
-  subscribes to the broker and shows the seat's state.
+  Same seat logic as before. Every state change, plus a heartbeat every
+  30 s, is sent straight to the backend as an HTTP POST. No MQTT broker.
 
   States (sent as text in the "state" field):
-    OCCUPIED = someone is sitting here            (was: LED solid on)
-    AWAY     = person stepped away, may come back (was: slow blink)
-    FREE     = seat free                          (was: fast blink)
+    OCCUPIED = someone is sitting here
+    AWAY     = person stepped away, may come back
+    FREE     = seat free
 
   How it decides:
     - Someone within SEAT_RANGE_CM for CONFIRM_MS        -> OCCUPIED
@@ -17,18 +16,14 @@
     - Back within range while AWAY                       -> OCCUPIED
     - Still nobody after AWAY_TIMEOUT_MS while AWAY      -> FREE
 
-  What gets sent:
-    Topic <TOPIC_BASE>/state  (retained, so a new subscriber gets the current state instantly)
-      {"seat":"seat-01","state":"OCCUPIED","near":true,"moving_cm":-1,"still_cm":42,
-       "rssi":-58,"reason":"change","uptime_s":123}
-      - rssi = Wi-Fi signal strength in dBm (-50..-67 good, below -80 expect dropouts)
-      - sent immediately on every state change ("reason":"change")
-      - repeated every HEARTBEAT_MS so the app knows the seat is still alive ("reason":"heartbeat")
-    Topic <TOPIC_BASE>/status (retained)
-      "online" when the ESP32 connects, "offline" sent automatically by the
-      broker if the ESP32 loses power or Wi-Fi (MQTT "last will").
+  What gets sent (POST to REPORT_URL, header X-Device-Key):
+    {"seat":"seat-01","state":"OCCUPIED","near":true,"moving_cm":-1,"still_cm":42,
+     "rssi":-58,"reason":"change","uptime_s":123}
+    reason = "boot" (just powered on), "change" (state changed), "heartbeat" (every 30 s)
+    If a send fails, it retries every 5 s until it gets through.
+    The backend marks the seat OFFLINE if it hears nothing for 90 s.
 
-  Needs the PubSubClient library (by Nick O'Leary) in addition to MyLD2410.
+  Only needs the MyLD2410 library (WiFi and HTTPClient come with the ESP32 board package).
 
   Wiring:
     Radar:   VCC -> 5V, GND -> GND, TX -> GPIO 16, RX -> GPIO 17
@@ -39,40 +34,28 @@
 */
 
 #include <WiFi.h>
-#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <MyLD2410.h>
 
 // ---------- Wi-Fi (2.4 GHz only) ----------
-// Default: "Dartmouth Public" (open network, no password, no registration).
-// For a phone hotspot, put its name and password below instead.
-// Uncomment USE_EDUROAM only for a PEAP/TTLS eduroam login (Dartmouth's eduroam uses certificates, so it won't work there).
-// #define USE_EDUROAM
+// "Dartmouth Public" is open: leave the password empty.
+// For a phone hotspot, put its name and password here instead.
+const char* WIFI_SSID     = "Dartmouth Public";
+const char* WIFI_PASSWORD = "";
 
-#ifdef USE_EDUROAM
-  // eduroam / WPA2-Enterprise. Check your institution's eduroam setup page for the method
-  // (most use PEAP; change to WPA2_AUTH_TTLS if yours says TTLS).
-  const char* WIFI_SSID         = "eduroam";
-  #define     EAP_METHOD          WPA2_AUTH_PEAP
-  const char* EAP_IDENTITY      = "anonymous@your-institution.edu"; // outer identity; if unsure, use the same as EAP_USERNAME
-  const char* EAP_USERNAME      = "username@your-institution.edu";  // full username including @domain
-  const char* EAP_PASSWORD      = "YOUR_EDUROAM_PASSWORD";
-#else
-  const char* WIFI_SSID         = "Dartmouth Public";
-  const char* WIFI_PASSWORD     = "";        // leave empty for an open network
-#endif
+// ---------- Backend ----------
+// Testing with laptop + ESP32 on the same phone hotspot:
+//   "http://<your laptop's IP on the hotspot>:8000/api/report"
+// After deploying:
+//   "https://<your-app>.onrender.com/api/report"
+const char* REPORT_URL = "http://192.168.1.100:8000/api/report";
+const char* DEVICE_KEY = "dev-key-change-me";   // must match DEVICE_KEYS on the server
 
-// ---------- MQTT ----------
-// Free public test broker: anyone can read/write it, fine for testing only.
-const char* MQTT_HOST = "broker.hivemq.com";
-const int   MQTT_PORT = 1883;
-
-#define SEAT_ID    "seat-01"                        // give every sensor its own ID
-#define TOPIC_BASE "seatnav-feldberg-x7k2/seats/" SEAT_ID // make "seatnav-feldberg" unique to your team
-
-const char* TOPIC_STATE  = TOPIC_BASE "/state";
-const char* TOPIC_STATUS = TOPIC_BASE "/status";
+#define SEAT_ID "seat-01"                        // give every sensor its own ID (letters, numbers, - and _)
 
 #define HEARTBEAT_MS 30000UL   // re-send the current state every 30 s
+#define RETRY_MS      5000UL   // after a failed send, try again this often
 
 // ---------- pins ----------
 #define RX_PIN 16
@@ -96,9 +79,8 @@ const char* TOPIC_STATUS = TOPIC_BASE "/status";
 HardwareSerial radarSerial(1);
 MyLD2410 sensor(radarSerial);
 
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
-char clientId[40];
+WiFiClient plainClient;          // for http://
+WiFiClientSecure secureClient;   // for https://
 
 enum SeatState { FREE, OCCUPIED, AWAY };
 SeatState state = FREE;
@@ -108,12 +90,17 @@ unsigned long goneSince = 0;       // when nobody was close anymore (0 = someone
 unsigned long occupiedSince = 0;   // when the seat turned OCCUPIED
 unsigned long awaySince = 0;       // when the seat turned AWAY
 unsigned long lastPrint = 0;
-unsigned long lastHeartbeat = 0;
 unsigned long lastWifiAttempt = 0;
-unsigned long lastMqttAttempt = 0;
 bool wifiWasConnected = false;
-bool pendingPublish = false;       // a state change happened while offline
 bool lastNear = false;
+
+// report queue: only the latest state matters, so one pending slot is enough
+bool pendingSend = false;
+const char* pendingReason = "boot";
+unsigned long lastSent = 0;        // last successful send
+unsigned long lastAttempt = 0;
+bool lastAttemptFailed = false;
+int lastHttpCode = 0;
 
 const char* stateCode() {
   if (state == FREE) return "FREE";
@@ -121,13 +108,14 @@ const char* stateCode() {
   return "AWAY";
 }
 
-// ---------- broadcasting ----------
-void publishState(const char* reason) {
-  if (!mqtt.connected()) {
-    pendingPublish = true;         // send it as soon as we're back online
-    return;
-  }
+// ---------- reporting ----------
+void requestSend(const char* reason) {
+  pendingSend = true;
+  pendingReason = reason;
+  lastAttemptFailed = false;       // a new state change goes out right away
+}
 
+bool sendReport(const char* reason) {
   int movingCm = sensor.movingTargetDetected()     ? (int)sensor.movingTargetDistance()     : -1;
   int stillCm  = sensor.stationaryTargetDetected() ? (int)sensor.stationaryTargetDistance() : -1;
 
@@ -138,34 +126,64 @@ void publishState(const char* reason) {
            SEAT_ID, stateCode(), lastNear ? "true" : "false", movingCm, stillCm,
            (int)WiFi.RSSI(), reason, millis() / 1000);
 
-  bool ok = mqtt.publish(TOPIC_STATE, payload, true);   // true = retained
-  Serial.print(ok ? "Published -> " : "Publish FAILED -> ");
-  Serial.println(payload);
-
-  if (ok) {
-    pendingPublish = false;
-    lastHeartbeat = millis();
+  HTTPClient http;
+  bool isHttps = strncmp(REPORT_URL, "https", 5) == 0;
+  bool started = isHttps ? http.begin(secureClient, REPORT_URL)
+                         : http.begin(plainClient, REPORT_URL);
+  if (!started) {
+    Serial.println("Send FAILED: REPORT_URL looks wrong.");
+    lastHttpCode = -1;
+    return false;
   }
+
+  http.setConnectTimeout(4000);
+  http.setTimeout(4000);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", DEVICE_KEY);
+
+  int code = http.POST((uint8_t*)payload, strlen(payload));
+  http.end();
+  lastHttpCode = code;
+
+  if (code >= 200 && code < 300) {
+    Serial.print("Sent -> ");
+    Serial.println(payload);
+    return true;
+  }
+
+  Serial.print("Send FAILED (");
+  if (code == 401)      Serial.print("401: server rejected DEVICE_KEY");
+  else if (code == 422) Serial.print("422: server rejected the data");
+  else if (code < 0)    { Serial.print("can't reach server: "); Serial.print(http.errorToString(code)); }
+  else                  { Serial.print("HTTP "); Serial.print(code); }
+  Serial.println("), retrying in 5 s");
+  return false;
 }
 
-void connectMqtt() {
-  Serial.print("Connecting to MQTT broker ");
-  Serial.print(MQTT_HOST);
-  Serial.print(" ... ");
-  // last will: the broker publishes "offline" for us if we disappear
-  if (mqtt.connect(clientId, TOPIC_STATUS, 1, true, "offline")) {
-    Serial.println("connected.");
-    mqtt.publish(TOPIC_STATUS, "online", true);
-    publishState(pendingPublish ? "change" : "connected");
+// Called every loop: sends queued reports and heartbeats, with retry
+void serviceReports() {
+  unsigned long now = millis();
+
+  if (!pendingSend && lastSent != 0 && now - lastSent >= HEARTBEAT_MS) {
+    pendingSend = true;
+    pendingReason = "heartbeat";
+  }
+
+  if (!pendingSend || WiFi.status() != WL_CONNECTED) return;
+  if (lastAttemptFailed && now - lastAttempt < RETRY_MS) return;
+
+  lastAttempt = now;
+  if (sendReport(pendingReason)) {
+    pendingSend = false;
+    lastAttemptFailed = false;
+    lastSent = millis();
   } else {
-    Serial.print("failed (code ");
-    Serial.print(mqtt.state());
-    Serial.println("), retrying in 5 s");
+    lastAttemptFailed = true;
   }
 }
 
-// Keeps Wi-Fi and MQTT alive without blocking the radar logic for long
-void maintainNetwork() {
+// ---------- Wi-Fi ----------
+void maintainWifi() {
   unsigned long now = millis();
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -185,18 +203,7 @@ void maintainNetwork() {
     wifiWasConnected = true;
     Serial.print("Wi-Fi connected, IP: ");
     Serial.println(WiFi.localIP());
-    lastMqttAttempt = 0;           // try MQTT right away
   }
-
-  if (!mqtt.connected()) {
-    if (lastMqttAttempt == 0 || now - lastMqttAttempt >= 5000) {
-      lastMqttAttempt = now;
-      connectMqtt();
-    }
-    return;
-  }
-
-  mqtt.loop();
 }
 
 // ---------- seat logic ----------
@@ -204,7 +211,7 @@ void setState(SeatState s) {
   state = s;
   Serial.print(">>> now ");
   Serial.println(stateCode());
-  publishState("change");
+  requestSend("change");
 }
 
 bool someoneNear() {
@@ -219,6 +226,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  // bigger buffer so radar data isn't lost while a report is being sent
+  radarSerial.setRxBufferSize(1024);
   radarSerial.begin(LD2410_BAUD_RATE, SERIAL_8N1, RX_PIN, TX_PIN);
   delay(500);
   if (!sensor.begin()) {
@@ -226,34 +235,31 @@ void setup() {
     while (true) { delay(1000); }
   }
 
-  // unique client ID per board (two devices with the same ID kick each other off)
-  uint32_t chip = (uint32_t)(ESP.getEfuseMac() >> 24);
-  snprintf(clientId, sizeof(clientId), "seatnav-%s-%06lX", SEAT_ID, (unsigned long)(chip & 0xFFFFFF));
+  // For https:// this skips checking the server's certificate. Fine for a
+  // student project; for extra security, load the server's root certificate
+  // with secureClient.setCACert(...) instead.
+  secureClient.setInsecure();
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-#ifdef USE_EDUROAM
-  WiFi.begin(WIFI_SSID, EAP_METHOD, EAP_IDENTITY, EAP_USERNAME, EAP_PASSWORD);
-#else
   if (strlen(WIFI_PASSWORD) == 0) WiFi.begin(WIFI_SSID);           // open network
   else                            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-#endif
   lastWifiAttempt = millis();
   Serial.print("Connecting to Wi-Fi \"");
   Serial.print(WIFI_SSID);
   Serial.println("\"...");
 
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setBufferSize(512);
-  mqtt.setSocketTimeout(3);
-
+  Serial.print("Reporting to ");
+  Serial.println(REPORT_URL);
   Serial.println("SeatNav running.");
-  setState(FREE);                  // queued until MQTT connects
+
+  state = FREE;
+  requestSend("boot");             // sent as soon as Wi-Fi connects
 }
 
 void loop() {
   sensor.check();
-  maintainNetwork();
+  maintainWifi();
 
   unsigned long now = millis();
   bool near = someoneNear();
@@ -296,14 +302,11 @@ void loop() {
       break;
   }
 
-  // heartbeat so the app can tell a quiet seat from a dead sensor
-  if (mqtt.connected() && now - lastHeartbeat >= HEARTBEAT_MS) {
-    publishState("heartbeat");
-  }
+  serviceReports();
 
   // status line once per second
-  if (now - lastPrint >= 1000) {
-    lastPrint = now;
+  if (millis() - lastPrint >= 1000) {
+    lastPrint = millis();
     Serial.print(stateCode());
     Serial.print("   near: ");
     Serial.print(near ? "yes" : "no ");
@@ -315,8 +318,8 @@ void loop() {
     else Serial.print("-");
     Serial.print(")   wifi: ");
     Serial.print(WiFi.status() == WL_CONNECTED ? "ok" : "--");
-    Serial.print("  mqtt: ");
-    Serial.print(mqtt.connected() ? "ok" : "--");
+    Serial.print("  server: ");
+    Serial.print(lastSent != 0 && !lastAttemptFailed ? "ok" : "--");
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("  rssi: ");
       Serial.print(WiFi.RSSI());

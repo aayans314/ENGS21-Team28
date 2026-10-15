@@ -1,55 +1,50 @@
 """
 SeatNav backend
 
-  1. Subscribes to the seat sensors on the MQTT broker
+  1. Receives reports straight from the seat sensors (POST /api/report)
   2. Saves every state change in a SQLite database (seatnav.db)
-  3. Serves the data to your app:
+  3. Serves the data to the app:
        GET  /api/seats                       all seats + summary (free / occupied / away / offline)
        GET  /api/seats/{seat_id}             one seat
        GET  /api/seats/{seat_id}/history     state changes, default last 24 h (?hours=...)
        GET  /api/seats/{seat_id}/usage       % of time free / occupied / away (?hours=...)
-       GET  /api/health                      is the server connected to the broker?
+       GET  /api/health                      quick "is the server up" check
        WS   /ws                              live updates pushed the moment a seat changes
        GET  /                                test dashboard
        GET  /docs                            interactive API docs (try every endpoint in the browser)
 
-Run:
+Run locally:
   pip install -r requirements.txt
-  uvicorn main:app --reload
+  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-Settings (environment variables, defaults match seatnav_mqtt.ino):
-  MQTT_HOST     broker.hivemq.com
-  MQTT_PORT     1883
-  TOPIC_PREFIX  seatnav-feldberg   <- must match the start of TOPIC_BASE in the sketch
-  DB_PATH       seatnav.db
+Settings (environment variables):
+  DEVICE_KEYS   comma-separated keys sensors must send in the X-Device-Key header
+                (default "dev-key-change-me", matching the sketch; change it before deploying)
+  DB_PATH       where the database file lives (default seatnav.db)
 """
 
 import asyncio
-import json
 import os
+import secrets
 import time
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import paho.mqtt.client as mqtt
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
-from store import Store
+from store import VALID_STATES, Store
 
-MQTT_HOST = os.getenv("MQTT_HOST", "broker.hivemq.com")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-TOPIC_PREFIX = os.getenv("TOPIC_PREFIX", "seatnav-feldberg-x7k2")
+DEFAULT_KEY = "dev-key-change-me"
+DEVICE_KEYS = [k.strip() for k in os.getenv("DEVICE_KEYS", DEFAULT_KEY).split(",") if k.strip()]
 DB_PATH = os.getenv("DB_PATH", "seatnav.db")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
 store = Store(DB_PATH)
 ws_clients: set[WebSocket] = set()
-event_loop: asyncio.AbstractEventLoop | None = None
-mqtt_connected = False
 
 
 # ---------- live updates to the app ----------
@@ -65,114 +60,75 @@ async def broadcast(message: dict):
         ws_clients.discard(ws)
 
 
-def push_from_mqtt_thread(message: dict):
-    """MQTT callbacks run in a background thread; hand the message to the web server's loop."""
-    if event_loop is not None:
-        asyncio.run_coroutine_threadsafe(broadcast(message), event_loop)
-
-
 def snapshot():
     now = time.time()
     seats = store.get_seats(now)
     return {"seats": seats, "summary": Store.summarize(seats), "server_time": now}
 
 
-# ---------- MQTT ----------
-
-def on_connect(client, userdata, flags, reason_code, properties):
-    global mqtt_connected
-    if reason_code.is_failure:
-        print(f"[mqtt] connection refused: {reason_code}")
-        return
-    mqtt_connected = True
-    print(f"[mqtt] connected to {MQTT_HOST}:{MQTT_PORT}")
-    client.subscribe(f"{TOPIC_PREFIX}/seats/+/state", qos=1)
-    client.subscribe(f"{TOPIC_PREFIX}/seats/+/status", qos=1)
-    print(f"[mqtt] listening on {TOPIC_PREFIX}/seats/+/state and /status")
-
-
-def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
-    global mqtt_connected
-    mqtt_connected = False
-    print(f"[mqtt] disconnected ({reason_code}), reconnecting automatically...")
-
-
-def on_message(client, userdata, msg):
-    parts = msg.topic.split("/")          # <prefix>/seats/<seat_id>/<state|status>
-    if len(parts) < 3:
-        return
-    seat_id, kind = parts[-2], parts[-1]
-    text = msg.payload.decode("utf-8", errors="replace").strip()
-    if not text:
-        return                            # empty retained message = topic was cleared
-    now = time.time()
-
-    if kind == "state":
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            print(f"[mqtt] ignored bad JSON on {msg.topic}: {text[:80]}")
-            return
-        seat, changed = store.handle_state(seat_id, data, now, retained=msg.retain)
-    elif kind == "status":
-        seat, changed = store.handle_status(seat_id, text, now, retained=msg.retain)
-    else:
-        return
-
-    if seat is None:
-        print(f"[mqtt] ignored unexpected message on {msg.topic}: {text[:80]}")
-        return
-
-    if changed:
-        print(f"[seat] {seat_id}: {seat['display_state']}")
-    push_from_mqtt_thread({"type": "seat", "seat": seat, "changed": changed})
-
-
 async def watch_for_silent_seats():
-    """A sensor that loses power may not send anything, so check regularly
-    and tell the app when a seat goes quiet (or comes back)."""
-    previous = {}
+    """A sensor that loses power just stops reporting, so check regularly and
+    mark seats offline once they've been silent for 90 s."""
     while True:
         await asyncio.sleep(10)
-        now = time.time()
-        for seat in store.get_seats(now):
-            was_live = previous.get(seat["seat_id"])
-            if was_live is not None and was_live != seat["live"]:
-                print(f"[seat] {seat['seat_id']}: {'back online' if seat['live'] else 'went silent'}")
-                await broadcast({"type": "seat", "seat": seat, "changed": True})
-            previous[seat["seat_id"]] = seat["live"]
+        for seat in store.mark_silent_seats_offline(time.time()):
+            print(f"[seat] {seat['seat_id']}: went silent, now OFFLINE")
+            await broadcast({"type": "seat", "seat": seat, "changed": True})
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global event_loop
-    event_loop = asyncio.get_running_loop()
-
-    client = mqtt.Client(
-        mqtt.CallbackAPIVersion.VERSION2,
-        client_id=f"seatnav-backend-{uuid.uuid4().hex[:8]}",
-    )
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
-    client.on_message = on_message
-    client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
-    client.loop_start()                   # runs in a background thread, reconnects on its own
-
+    if DEVICE_KEYS == [DEFAULT_KEY]:
+        print("[warning] using the default device key; set DEVICE_KEYS before deploying")
     watcher = asyncio.create_task(watch_for_silent_seats())
     yield
     watcher.cancel()
-    client.loop_stop()
-    client.disconnect()
 
-
-# ---------- web API ----------
 
 app = FastAPI(title="SeatNav API", lifespan=lifespan)
 
-# Allow the app (or a dev server on another port) to call the API from a browser.
-# Tighten allow_origins to your app's address before going public.
+# Lets the web version of the app call the API from a browser.
+# Tighten allow_origins to your app's web address before going public.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+# ---------- sensors report here ----------
+
+class Report(BaseModel):
+    seat: str = Field(pattern=r"^[A-Za-z0-9_-]{1,40}$")
+    state: str
+    near: bool = False
+    moving_cm: int = -1
+    still_cm: int = -1
+    rssi: int | None = None
+    reason: str = "change"
+    uptime_s: int | None = None
+
+
+def key_is_valid(key: str | None) -> bool:
+    if not key:
+        return False
+    return any(secrets.compare_digest(key, k) for k in DEVICE_KEYS)
+
+
+@app.post("/api/report")
+async def report(r: Report, x_device_key: str | None = Header(default=None)):
+    if not key_is_valid(x_device_key):
+        raise HTTPException(401, "Missing or wrong X-Device-Key")
+    if r.state.upper() not in VALID_STATES:
+        raise HTTPException(422, f"state must be one of {', '.join(VALID_STATES)}")
+
+    now = time.time()
+    store.handle_status(r.seat, "online", now)          # logs 'online' if it was offline or new
+    seat, changed = store.handle_state(r.seat, r.model_dump(), now)
+
+    if changed:
+        print(f"[seat] {r.seat}: {seat['display_state']} ({r.reason})")
+    await broadcast({"type": "seat", "seat": seat, "changed": changed})
+    return {"ok": True, "display_state": seat["display_state"]}
+
+
+# ---------- the app reads from here ----------
 
 @app.get("/")
 def dashboard():
@@ -181,7 +137,7 @@ def dashboard():
 
 @app.get("/api/health")
 def health():
-    return {"mqtt_connected": mqtt_connected, "broker": MQTT_HOST, "topic_prefix": TOPIC_PREFIX}
+    return {"ok": True, "server_time": time.time()}
 
 
 @app.get("/api/seats")

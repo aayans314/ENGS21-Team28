@@ -1,5 +1,6 @@
 """
 SeatNav storage: keeps the current state of every seat plus a history of changes.
+Used by main.py; plain Python + SQLite, no extra libraries.
 
 Two tables:
   seats   one row per seat, always the latest values (what the app shows right now)
@@ -168,6 +169,20 @@ class Store:
 
             self.db.commit()
             return self._seat(seat_id, now), changed
+
+    def mark_silent_seats_offline(self, now):
+        """Seats marked online that haven't reported for STALE_AFTER_S get marked
+        offline (and an 'offline' history event). Returns the updated seats."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT seat_id FROM seats WHERE online = 1 AND (last_seen IS NULL OR last_seen < ?)",
+                (now - STALE_AFTER_S,),
+            ).fetchall()
+        updated = []
+        for r in rows:
+            seat, _ = self.handle_status(r["seat_id"], "offline", now)
+            updated.append(seat)
+        return updated
 
     # ---------- reading ----------
 

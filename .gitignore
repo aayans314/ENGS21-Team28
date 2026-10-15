@@ -1,2 +1,22 @@
+# Secrets
+.env
+secrets.h
+ 
+# Backend
 __pycache__/
+venv/
+.venv/
 *.db
+ 
+# App
+node_modules/
+.expo/
+dist/
+web-build/
+ios/
+android/
+ 
+# OS
+.DS_Store
+Thumbs.db
+ 
