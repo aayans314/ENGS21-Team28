@@ -5,4 +5,4 @@
 //   After deploying the backend:                    "https://<your-app>.onrender.com"
 //
 // On a phone, "localhost" means the phone itself, so use the laptop's IP there.
-export const API_URL = "http://10.94.65.158:8000";
+export const API_URL = "https://engs21-team28.onrender.com";
