@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SeatNav</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f3f5f2;
+    --surface: #ffffff;
+    --text: #1c231f;
+    --muted: #5d6862;
+    --line: #d9dfda;
+    --brand: #00693e;
+    --free: #2e7d4f;
+    --occupied: #a23b2a;
+    --away: #b7801a;
+    --offline: #8a918d;
+    --tint-free: #e4f1e8;
+    --tint-occupied: #f6e4e0;
+    --tint-away: #f7eedb;
+    --tint-offline: #eceeed;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #121614;
+      --surface: #1a201c;
+      --text: #e5eae6;
+      --muted: #9aa69f;
+      --line: #2c3530;
+      --brand: #4fb386;
+      --free: #5cbf85;
+      --occupied: #e2735f;
+      --away: #e0ac48;
+      --offline: #7d8682;
+      --tint-free: #1c2f23;
+      --tint-occupied: #35201b;
+      --tint-away: #332a17;
+      --tint-offline: #222826;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 40px 20px 64px; }
+
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  .brand { font-weight: 600; color: var(--brand); margin: 0; font-size: 1rem; }
+  .conn { font-size: 0.875rem; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  .conn::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--offline); }
+  .conn.ok::before { background: var(--free); }
+
+  .hero {
+    font-family: Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif;
+    font-size: clamp(2.25rem, 6vw, 3.75rem);
+    line-height: 1.1;
+    font-weight: 400;
+    margin: 32px 0 8px;
+  }
+  .hero b { font-weight: 700; color: var(--free); }
+  .tally { color: var(--muted); margin: 0 0 36px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; }
+
+  /* each tile is drawn like a carrel: a desk with a partition along the top */
+  .seat {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-top: 6px solid var(--state);
+    border-radius: 4px 4px 10px 10px;
+    padding: 14px 16px 16px;
+  }
+  .seat h2 { margin: 0; font-size: 0.95rem; font-weight: 600; }
+  .seat .state {
+    display: inline-block;
+    margin: 10px 0 4px;
+    padding: 2px 10px;
+    border-radius: 999px;
+    background: var(--tint);
+    color: var(--state);
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .seat .since, .seat .meta { margin: 0; font-size: 0.85rem; color: var(--muted); }
+  .seat .meta { margin-top: 8px; }
+
+  .seat[data-state="FREE"]     { --state: var(--free);     --tint: var(--tint-free); }
+  .seat[data-state="OCCUPIED"] { --state: var(--occupied); --tint: var(--tint-occupied); }
+  .seat[data-state="AWAY"]     { --state: var(--away);     --tint: var(--tint-away); }
+  .seat[data-state="OFFLINE"]  { --state: var(--offline);  --tint: var(--tint-offline); }
+
+  .seat.flash { animation: flash 1.2s ease-out; }
+  @keyframes flash { from { box-shadow: 0 0 0 4px var(--tint); } to { box-shadow: 0 0 0 0 transparent; } }
+  @media (prefers-reduced-motion: reduce) { .seat.flash { animation: none; } }
+
+  .empty { color: var(--muted); max-width: 60ch; }
+  .empty code { background: var(--surface); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; }
+  footer { margin-top: 40px; font-size: 0.85rem; color: var(--muted); }
+  footer a { color: var(--brand); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="brand">SeatNav</p>
+    <span class="conn" id="conn">Connecting…</span>
+  </header>
+
+  <h1 class="hero" id="hero">Loading seats…</h1>
+  <p class="tally" id="tally"></p>
+
+  <section class="grid" id="grid" aria-live="polite"></section>
+
+  <footer>Updates live as sensors report. API docs at <a href="/docs">/docs</a>.</footer>
+</main>
+
+<script>
+  const seats = new Map();
+  let clockOffset = 0;   // server time minus browser time, in seconds
+
+  const LABEL = { FREE: "Free", OCCUPIED: "Occupied", AWAY: "Away", OFFLINE: "Sensor offline" };
+
+  function serverNow() { return Date.now() / 1000 + clockOffset; }
+
+  function duration(seconds) {
+    if (seconds == null || seconds < 0) return "";
+    if (seconds < 60) return "under a minute";
+    const m = Math.floor(seconds / 60);
+    if (m < 60) return m + (m === 1 ? " minute" : " minutes");
+    const h = Math.floor(m / 60), rest = m % 60;
+    return h + " h " + rest + " min";
+  }
+
+  function signal(rssi) {
+    if (rssi == null) return "";
+    const word = rssi >= -67 ? "good" : rssi >= -75 ? "fair" : "weak";
+    return "Wi-Fi " + word + " (" + rssi + " dBm)";
+  }
+
+  function render(changedId) {
+    const list = [...seats.values()].sort((a, b) => a.seat_id.localeCompare(b.seat_id, undefined, { numeric: true }));
+    const count = { FREE: 0, OCCUPIED: 0, AWAY: 0, OFFLINE: 0 };
+    list.forEach(s => count[s.display_state]++);
+
+    const hero = document.getElementById("hero");
+    const tally = document.getElementById("tally");
+    const grid = document.getElementById("grid");
+
+    if (list.length === 0) {
+      hero.textContent = "No seats yet";
+      tally.textContent = "";
+      grid.innerHTML = "";
+      const p = document.createElement("p");
+      p.className = "empty";
+      p.innerHTML = "Waiting for the first sensor to report. Power on a SeatNav sensor, or run " +
+                    "<code>python simulate.py</code> to add test seats.";
+      grid.appendChild(p);
+      return;
+    }
+
+    const reporting = list.length - count.OFFLINE;
+    hero.innerHTML = "";
+    const b = document.createElement("b");
+    b.textContent = count.FREE;
+    hero.append(b, " of " + reporting + (reporting === 1 ? " seat" : " seats") + " free");
+    tally.textContent = count.OCCUPIED + " occupied, " + count.AWAY + " away" +
+                        (count.OFFLINE ? ", " + count.OFFLINE + " sensor" + (count.OFFLINE === 1 ? "" : "s") + " offline" : "");
+
+    grid.innerHTML = "";
+    for (const s of list) {
+      const el = document.createElement("article");
+      el.className = "seat" + (s.seat_id === changedId ? " flash" : "");
+      el.dataset.state = s.display_state;
+
+      const h = document.createElement("h2");
+      h.textContent = s.seat_id;
+
+      const state = document.createElement("span");
+      state.className = "state";
+      state.textContent = LABEL[s.display_state];
+
+      const since = document.createElement("p");
+      since.className = "since";
+      if (s.display_state === "OFFLINE") {
+        since.textContent = s.last_seen ? "Last heard " + duration(serverNow() - s.last_seen) + " ago" : "No recent data";
+      } else if (s.state_since) {
+        since.textContent = "For " + duration(serverNow() - s.state_since);
+      }
+
+      const meta = document.createElement("p");
+      meta.className = "meta";
+      meta.textContent = s.display_state === "OFFLINE" ? "" : signal(s.rssi);
+
+      el.append(h, state, since, meta);
+      grid.appendChild(el);
+    }
+  }
+
+  function applySnapshot(data) {
+    clockOffset = data.server_time - Date.now() / 1000;
+    seats.clear();
+    data.seats.forEach(s => seats.set(s.seat_id, s));
+    render();
+  }
+
+  function connect() {
+    const conn = document.getElementById("conn");
+    const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+
+    ws.onopen = () => { conn.textContent = "Live"; conn.classList.add("ok"); };
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "snapshot") applySnapshot(msg);
+      if (msg.type === "seat") {
+        seats.set(msg.seat.seat_id, msg.seat);
+        render(msg.changed ? msg.seat.seat_id : null);
+      }
+    };
+    ws.onclose = () => {
+      conn.textContent = "Reconnecting to server…";
+      conn.classList.remove("ok");
+      setTimeout(connect, 3000);
+    };
+  }
+
+  connect();
+  setInterval(() => render(), 15000);   // keep the "for X minutes" text current
+</script>
+</body>
+</html>
