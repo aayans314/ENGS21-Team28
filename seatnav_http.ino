@@ -37,6 +37,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <MyLD2410.h>
+#include "secrets.h"
 
 // ---------- Wi-Fi (2.4 GHz only) ----------
 // "Dartmouth Public" is open: leave the password empty.
@@ -49,8 +50,8 @@ const char* WIFI_PASSWORD = "";
 //   "http://<your laptop's IP on the hotspot>:8000/api/report"
 // After deploying:
 //   "https://<your-app>.onrender.com/api/report"
-const char* REPORT_URL = "http://192.168.1.100:8000/api/report";
-const char* DEVICE_KEY = "dev-key-change-me";   // must match DEVICE_KEYS on the server
+const char* REPORT_URL = "https://engs21-team28.onrender.com/api/report";
+const char* DEVICE_KEY = "DEVICE_KEYS";   // must match DEVICE_KEYS on the server
 
 #define SEAT_ID "seat-01"                        // give every sensor its own ID (letters, numbers, - and _)
 
